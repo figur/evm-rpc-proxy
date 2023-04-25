@@ -1,24 +1,103 @@
+use bytes::Bytes;
+use dotenv::dotenv;
 use http::Uri;
-use hyper::service::{make_service_fn, service_fn};
+use hyper::service::{make_service_fn};
 use hyper::{Body, Client, Request, Response, Server};
 use reqwest::Client as ReqwestClient;
 use serde_json::{json, Value};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tokio::time;
-use dotenv::dotenv;
 use std::env;
+use std::fmt;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::RwLock;
+use tokio::time;
+use hyper::body::to_bytes;
+
+#[derive(Debug)]
+pub enum ProxyError {
+    AllRpcServersFailed,
+    HyperError(hyper::Error),
+}
+
+impl fmt::Display for ProxyError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            ProxyError::AllRpcServersFailed => write!(f, "All RPC servers failed"),
+            ProxyError::HyperError(err) => write!(f, "Hyper error: {}", err),
+        }
+    }
+}
+
+impl std::error::Error for ProxyError {}
+
+impl From<hyper::Error> for ProxyError {
+    fn from(err: hyper::Error) -> ProxyError {
+        ProxyError::HyperError(err)
+    }
+}
+pub struct ClonableRequest {
+    pub req: Request<ClonableBody>,
+}
+
+pub struct ClonableBody(pub Arc<Bytes>);
+
+impl From<Body> for ClonableBody {
+    fn from(body: Body) -> Self {
+        let body_bytes = tokio::runtime::Handle::current()
+            .block_on(async { to_bytes(body).await })
+            .unwrap();
+        ClonableBody(Arc::new(body_bytes))
+    }
+}
+
+impl Clone for ClonableBody {
+    fn clone(&self) -> Self {
+        ClonableBody(self.0.clone())
+    }
+}
+
+impl Into<Body> for ClonableBody {
+    fn into(self) -> Body {
+        Body::from(self.0.as_ref().clone())
+    }
+}
+
+
+impl Clone for ClonableRequest {
+    fn clone(&self) -> Self {
+        let req = &self.req;
+        let mut req_builder = Request::builder()
+            .method(req.method().clone())
+            .uri(req.uri().clone())
+            .version(req.version());
+
+        for (name, value) in req.headers().iter() {
+            req_builder = req_builder.header(name, value);
+        }
+
+        let body = self.req.body().clone();
+        req_builder.body(body).unwrap().into()
+    }
+}
+
+impl From<Request<ClonableBody>> for ClonableRequest {
+    fn from(req: Request<ClonableBody>) -> Self {
+        ClonableRequest { req }
+    }
+}
 
 type RpcServer = (String, u64, u128);
 
-async fn update_rpc_stats(rpc_servers: Arc<Mutex<Vec<RpcServer>>>) -> Result<(), Box<dyn std::error::Error>> {
+async fn update_rpc_stats(
+    rpc_servers: Arc<RwLock<Vec<RpcServer>>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client: ReqwestClient = ReqwestClient::new();
     let mut interval: time::Interval = time::interval(Duration::from_secs(10));
 
     loop {
         interval.tick().await;
 
-        let rpc_servers_cloned: Vec<(String, u64, u128)> = rpc_servers.lock().unwrap().clone();
+        let rpc_servers_cloned: Vec<(String, u64, u128)> = rpc_servers.read().await.clone();
         let mut updated_servers: Vec<(String, u64, u128)> = Vec::new();
         for (url, _, _) in &rpc_servers_cloned {
             let latency: u128 = match client.get(url.clone()).send().await {
@@ -49,73 +128,78 @@ async fn update_rpc_stats(rpc_servers: Arc<Mutex<Vec<RpcServer>>>) -> Result<(),
         }
 
         updated_servers.sort_by_key(|(_, block, latency)| (u64::MAX - block, *latency));
-        *rpc_servers.lock().unwrap() = updated_servers;
+        *rpc_servers.write().await = updated_servers;
     }
+}
+
+async fn get_best_rpc(rpc_servers: Vec<RpcServer>) -> Option<RpcServer> {
+    rpc_servers.first().cloned()
 }
 
 async fn proxy_request(
-    req: Request<Body>,
-    rpc_servers: Arc<Mutex<Vec<RpcServer>>>,
-) -> Result<Response<Body>, hyper::Error> {
-    let best_rpc: (String, u64, u128) = rpc_servers.lock().unwrap()[0].clone();
-    let uri: String = format!("http://{}{}", best_rpc.0, req.uri());
-    let uri: Uri = uri.parse::<Uri>().unwrap();
+    clonable_req: &ClonableRequest,
+    rpc_servers: Arc<RwLock<Vec<RpcServer>>>,
+) -> Result<Response<Body>, ProxyError> {
     let client: Client<hyper::client::HttpConnector> = Client::new();
 
-    let mut builder: http::request::Builder = Request::builder()
-        .method(req.method().clone())
-        .uri(uri)
-        .version(req.version());
+    for _ in 0..rpc_servers.read().await.len() {
+        if let Some((url, _, _)) = get_best_rpc(rpc_servers.read().await.clone()).await {
+            let uri: String = format!("http://{}{}", url, clonable_req.req.uri());
+            let uri: Uri = uri.parse::<Uri>().unwrap();
 
-    for (name, value) in req.headers().iter() {
-        builder = builder.header(name, value);
+            // Clone the request and create a new ClonableBody instance
+            let cloned_body = ClonableBody(Arc::clone(&clonable_req.req.body().0));
+            let cloned_req = Request::builder()
+                .method(clonable_req.req.method().clone())
+                .uri(uri)
+                .version(clonable_req.req.version())
+                .header(http::header::HOST, url.as_str())
+                .body(cloned_body.into())
+                .unwrap();
+
+            match client.request(cloned_req).await {
+                Ok(resp) => return Ok(resp),
+                Err(_) => continue,
+            };
+        } else {
+            return Err(ProxyError::AllRpcServersFailed);
+        }
     }
 
-    let req: Request<Body> = builder.body(req.into_body()).unwrap();
-    client.request(req).await
+    Err(ProxyError::AllRpcServersFailed)
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
-
-    let rpc_servers: Vec<String> = env::var("RPC_SERVERS")
-        .expect("RPC_SERVERS must be set in .env file")
+    let addr = ([127, 0, 0, 1], env::var("PORT")?.parse::<u16>()?).into();
+    let server_urls: Vec<String> = env::var("RPC_SERVERS")?
         .split(',')
-        .map(|s| s.to_owned())
+        .map(|s| s.trim().to_string())
         .collect();
+    let rpc_servers: Arc<RwLock<Vec<(String, u64, u128)>>> = Arc::new(RwLock::new(Vec::new()));
+    for url in server_urls {
+        rpc_servers.write().await.push((url, 0, 0)); // Remove unwrap() call
+    }
 
-    let rpc_servers_data: Vec<(String, u64, u128)> = rpc_servers
-        .iter()
-        .map(|url| (url.clone(), 0, u128::MAX))
-        .collect();
+    tokio::spawn(update_rpc_stats(rpc_servers.clone()));
 
-    let rpc_servers: Arc<Mutex<Vec<(String, u64, u128)>>> = Arc::new(Mutex::new(rpc_servers_data));
-
-    let rpc_servers_clone: Arc<Mutex<Vec<(String, u64, u128)>>> = rpc_servers.clone();
-
-    tokio::spawn(async move {
-        if let Err(e) = update_rpc_stats(rpc_servers_clone).await {
-            eprintln!("Error updating RPC stats: {}", e);
+    let make_svc = make_service_fn(move |_conn| {
+        let rpc_servers = rpc_servers.clone();
+        async move {
+            let cloned_req = ClonableRequest(req.clone());
+            match proxy_request(&cloned_req, rpc_servers.clone()).await {
+                Ok(response) => Ok(response),
+                Err(_) => Ok(Response::builder().status(500).body(Body::empty()).unwrap()),
+            }
         }
     });
 
-    let make_svc = make_service_fn(move |_conn: &hyper::server::conn::AddrStream| {
-        let rpc_servers: Arc<Mutex<Vec<(String, u64, u128)>>> = rpc_servers.clone();
-        async {
-            Ok::<_, hyper::Error>(service_fn(move |req: Request<Body>| {
-                proxy_request(req, rpc_servers.clone())
-            }))
-        }
-    });
-
-    let addr: std::net::SocketAddr = ([127, 0, 0, 1], 8080).into();
     let server = Server::bind(&addr).serve(make_svc);
 
-    println!("EVM RPC Proxy running on http://{}", addr);
+    println!("Listening on http://{}", addr);
 
-    if let Err(e) = server.await {
-        eprintln!("server error: {}", e);
-    }
+    server.await?;
+
+    Ok(())
 }
-
