@@ -664,6 +664,7 @@ dependencies = [
  "futures",
  "http",
  "hyper",
+ "hyper-tls",
  "reqwest",
  "serde",
  "serde_json",
